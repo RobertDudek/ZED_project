@@ -1,0 +1,208 @@
+---
+title: "ZED_R_project"
+author: "Robert Dudek"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+  editor_options:
+    chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+## Wstęp
+Poniżej podjęto próbę analizy danych z WDI oraz predykcji ceny złota na jej podstawię. Z analizy wynika, że wiele z najważniejszych atrybutów które znalazł regresor jest nietypowa np. Czas potrzebny do wybudowania magazynu.  
+
+
+## Wykorzystane biblioteki:
+
+```{r libraries, message=FALSE}
+library("knitr")
+library("DT")
+library("readxl") # Reading excel files
+library("tidyr")
+library("dplyr")
+library("zoo") # NA interpolation
+library("corrr")
+library("ggplot2")
+library("plotly")
+library("ggcorrplot")
+library("caret")
+```
+
+## Zapewnienie powtarzalności:
+```{r seed}
+set.seed(23)
+```
+
+## Wczytywanie danych
+
+```{r reading}
+WDI <- read_excel("Data_pack/World_Development_Indicators.xlsx", sheet = 1, na="..")
+
+currencyEx <- read.table("Data_pack/CurrencyExchangeRates.csv", header=TRUE, sep = ",")
+
+```
+
+## Czyszczenie danych:
+
+### 1. Usunięcie ostatnich 5 linii (puste/metadane).
+### 2. Usunięcie kolumny z kodem kraju, ponieważ jest jego nazwa oraz nazwy serii, ponieważ jest jej kod.
+### 3. Zamiana kolumn lat na 1 kolumne z rokiem.
+### 4. Zamiana jednej kolumny nazwy serii na różne kolumny z danymi.
+### 5. Zamiana formatu lat na 4 cyfry.
+### 6. Interpolacja oraz ekstrapolacja wszystkich możliwych danych w miejce braku danych, aby zapewnić jak najwięcej danych do późniejszej analizy.
+### 7. Usuwanie serii/krajów dla których posiadamy najmniej danych procentowo, aż uzyskamy zbiór bez brakujących wartości.
+
+```{r cleaning}
+WDI <- WDI %>% slice_head(n = 44304) %>% 
+  select(-c("Country Code", "Series Name")) %>% # 2
+  pivot_longer(3:53, names_to="Year") %>% # 3
+  pivot_wider(names_from = `Series Code`, values_from = value) %>% # 4
+  mutate(Year = substr(Year, 1, 4))
+# 6. Interpolating and extrapolating all possible values
+WDI <- WDI %>%
+  group_by(`Country Name`) %>%
+  mutate_at(3:215, na.approx, na.rm=FALSE, rule = 2) %>%
+  ungroup()
+
+WDI <- WDI %>% arrange(`Country Name`, Year)
+
+
+# 7. Removing measures/countries with most % of Na's until we are left with no Na's 
+while(TRUE){
+  summirize_NAs <- WDI %>%
+    select(-2) %>%
+    group_by(`Country Name`) %>%
+    summarise_all(funs(sum(is.na(.)))) %>%
+    ungroup();
+  row_NAs <- summirize_NAs %>%
+    mutate(sum = rowSums(across(where(is.numeric)))/(ncol(summirize_NAs)-1)/51);
+  col_NAs <- row_NAs %>%
+    summarise(across(-1, ~ sum(., is.na(.), 0)/nrow(row_NAs)/51));
+  
+  max_row <- max(row_NAs %>% select(sum));
+  max_row_index <- which(row_NAs %>% select(sum)==max_row);
+  
+  max_col <- max(col_NAs);
+  max_col_index <- which(col_NAs==max_col);
+  if(max_col==max_row && max_col==0) break;
+  if(max_col > max_row) { WDI <- WDI %>% select(-(max_col_index+2));
+  } else WDI <- WDI %>% slice(-((51*(max_row_index-1)+1):(51*max_row_index)));
+}
+
+```
+
+## Rozmiar zbioru i statystyki wartości
+Po uzyskaniu zbioru bez wartości pustych pozostało 122 z początkowych 213 serii (57.3%) oraz 141 z 208 początkowych krajów (67.8%) z danymi ekstrapolowanymi do wszystkich 51 lat.
+```{r sizing}
+dim(WDI)
+kable(summary.data.frame(WDI))
+
+```
+
+## Korelacja między seriami
+
+```{r corr}
+WDI %>% select(-(1:2)) %>% correlate()
+ggcorrplot(cor(WDI %>% select(-(1:2))), tl.cex = 5, hc.order = TRUE)
+
+```
+
+
+## Predykcja ceny złota:
+### 1. Uśredniamy cene złota w kolejnych latach, usuwamy lata 1968, 1969 i 2021 o których nie mamy danych. Ceny zostawiamy tylko w dolarach amerykańskich i zmieniamy nazwę jej kolumny na Price. Pokazujemy interaktywny wykres zeleżności ceny złota od czasu.
+### 2. Uśredniamy wszystkie dane krajów w kolejnych latach i łaczymy tabele z WDI z tabelą cen złota.
+### 3. Usuwamy kolumnę z rokiem.
+### 4. TWorzymy zbiór treningowy i testowy.
+### 5. Ustawiamy metodę trenowania na repeatedCV 5, powtarzane 5 razy. 
+### 6. Trenujemy model Algorytmem random forest (ranger) 
+### 7. Testujemy model na zbiorze tesowym i obliczmy RMSE.
+
+
+```{r gold}
+# 1
+gold_prices <- read.csv("Data_pack/Gold prices.csv", sep=',')
+gold_prices <- gold_prices %>%
+  rename(Price = `USD..AM.`) %>% 
+  mutate(Year = substr(Date, 1, 4)) %>% 
+  select(-1) %>% 
+  group_by(Year) %>% 
+  summarise(across(1, ~ mean(., na.rm = TRUE))) %>% 
+  slice(-c(1,2,54))
+
+# 2
+Gold_prediction <- WDI %>% select(-1) %>% group_by(Year) %>% summarise(across(-1, ~ mean(.)))
+
+# 3
+Gold_prediction <- Gold_prediction %>% inner_join(gold_prices, by='Year') 
+
+```
+
+
+```{r goldPriceChart}
+p <- Gold_prediction %>%
+     ggplot( aes(Year, Price)) +
+     geom_point() +
+     theme_bw()
+ggplotly(p)
+
+
+```
+
+
+```{r training}
+trainIndx <- createDataPartition(Gold_prediction$Price,
+                                 p = 4/5, 
+                                 list = FALSE)
+ #Do not use Year for the model
+Gold_prediction_filtered <- Gold_prediction %>% select(-Year)
+training <- Gold_prediction_filtered[ trainIndx, ]
+testing  <- Gold_prediction_filtered[-trainIndx, ]
+
+fitControl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 5,
+  verboseIter = FALSE,
+  returnResamp = "all")
+
+set.seed(12)
+rrfFit <- train(Price ~ ., 
+                 data = training,
+                 method = 'ranger',
+                 tuneLength = 10, 
+                 trControl = fitControl,
+                 num.trees = 700,
+                 importance = "permutation")
+
+
+trellis.par.set(caretTheme())
+plot(rrfFit)
+
+testPred <- predict(rrfFit , testing)
+
+```
+
+RMSE uzyskany przez model to `r RMSE(testPred,testing$Price)`
+
+## Analiza ważności atrybutów:
+10 najważniejszych atrybutów wraz z opisami:
+
+```{r varImp}
+WDI_metadata <- read_excel("Data_pack/World_Development_Indicators.xlsx", sheet = 2, na="..")
+imp <- varImp(rrfFit)$importance %>% arrange(-Overall) %>% slice_head(n = 10)
+imp
+WDI_metadata %>% select(c("Indicator Name", "Long definition")) %>% filter(WDI_metadata$Code %in% rownames(imp))
+
+```
+
+
+
+
+
